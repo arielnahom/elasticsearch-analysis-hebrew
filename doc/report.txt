@@ -1,0 +1,73 @@
+# Hebrew Analysis Migration and Re-architecture Report
+
+## 1. The "Gold" (Core Logic vs. Tech-Fluff)
+The analysis covers two repositories: `elasticsearch-analysis-hebrew` (the wrapper) and `HebMorph` (the core logic).
+
+**The Tech-Fluff and Wrappers:**
+*   **`elasticsearch-analysis-hebrew`:** This entire repository is essentially "tech-fluff" in the context of core logic. It provides the boilerplate necessary to integrate `HebMorph` into Elasticsearch. This includes `HebrewAnalysisPlugin.java` (plugin registration), custom REST actions (`RestHebrewAnalyzerCheckWordAction.java`), and various `AnalyzerProvider`, `TokenizerFactory`, and `TokenFilterFactory` classes that just delegate to `hebmorph-lucene`.
+*   **`HebMorph` (Build & Packaging):** Build scripts (Gradle/Maven configurations), Bintray publishing logic, Solr integration files, and Lucene wrapper classes (`HebrewQueryAnalyzer`, `HebrewTokenizer` in `org.apache.lucene.analysis.hebrew` packages) that adapt the core logic to Lucene's specific `TokenStream` API.
+
+**The "Gold" (Real Data and Core Logic):**
+The true value of the project lives inside the `HebMorph` repository, specifically within the `com.code972.hebmorph` Java package. The gold consists of:
+*   **Data Structures (`DictHebMorph`, `DictRadix`):** Custom optimized data structures for storing and rapidly querying the Hebrew lexicon and morphological data.
+*   **The Lemmatizer (`Lemmatizer.java`, `StreamLemmatizer.java`):** The algorithmic heart of the project. It handles prefix stripping (handling quotes and single quotes according to Hebrew Academy rules), Niqqud removal, and identifying the base lemma(s) of a given Hebrew word by checking against the dictionary and handling prefixes.
+*   **Tolerant Lookup (`LookupTolerators.java`):** Logic to handle Hebrew spelling variations (Ktiv Male/Haser), specifically tolerating "Em Kryia" (vowel letters like Yod and Vav).
+*   **Dictionary Loaders (`HSpellLoader.java`, `HSpellDictionaryLoader.java`):** The logic required to parse, decode, and load the `hspell` (or commercial) dictionary files (.wgz, .stems, .prefixes, etc.) into the `DictHebMorph` structure.
+
+## 2. Project Overview
+This project aims to provide high-quality morphological analysis and search capabilities for the Hebrew language within Lucene and Elasticsearch. Because Hebrew is a highly inflected language where prefixes (like "and", "the", "in", "from") and suffixes are attached directly to the base word, standard whitespace tokenization and simple stemming are insufficient for good search recall.
+
+The solution is split into two layers:
+1.  **`HebMorph`:** An independent morphological engine and Lucene analysis library. It loads a Hebrew dictionary (typically the open-source `hspell` or a proprietary commercial one) and uses it to perform lemmatization (reducing a word to its base form) and tokenization tailored for Hebrew text.
+2.  **`elasticsearch-analysis-hebrew`:** An Elasticsearch plugin that exposes the `hebmorph-lucene` analyzers (`hebrew`, `hebrew_query`, `hebrew_exact`) to Elasticsearch indices.
+
+## 3. Missing Parts and Gaps (State of the Project)
+The project suffers from several gaps due to a lack of recent maintenance:
+*   **Outdated Elasticsearch Target:** The `elasticsearch-analysis-hebrew` `build.gradle` defaults to Elasticsearch version `7.4.0`. The current major version of Elasticsearch is 8.x. Plugin architectures and internal Lucene versions change drastically between Elasticsearch major versions.
+*   **Outdated Lucene Target:** The `hebmorph-lucene` dependency targets Lucene 8.0.0. Modern Lucene is on version 9.x.
+*   **Legacy Build Systems & Dependencies:** The build heavily relies on deprecated services like JCenter and Bintray (`com.jfrog.bintray` plugin). The use of `testCompile` and `compile` configurations in Gradle is deprecated in modern Gradle versions (should be `implementation` and `testImplementation`).
+*   **Security Manager Restrictions:** Elasticsearch enforces a strict Java Security Manager. The plugin currently requires users to manually accept `java.io.FilePermission` warnings during installation to read the external dictionary files from disk.
+*   **Lack of Native Query Parser Integration:** The README notes: *"This plugin does not currently ship with a QueryParser implementation that can be used to power query_string queries."* Users are forced to use `match` queries because standard query parsers don't handle Hebrew acronyms (which use quotes) well.
+*   **Java Versioning:** The `HebMorph` project specifies `sourceCompatibility = 1.8`. Modern Elasticsearch runs on Java 17 or 21, and the codebase is missing out on modern Java language features (records, improved switch statements, etc.).
+
+## 4. Migration Plan
+If the goal is to modernize the project for current systems (Elasticsearch 8.x / OpenSearch 2.x), the following migration plan is recommended:
+
+**Phase 1: Build & Dependency Modernization**
+*   Update Gradle to the latest version (8.x).
+*   Replace deprecated `compile` with `implementation` in `build.gradle`.
+*   Remove Bintray and JCenter; migrate publishing to Maven Central via Sonatype OSSRH.
+*   Update `hebmorph-lucene` to target Lucene 9.x. Fix any API breakages in the `TokenStream` and `Analyzer` implementations.
+
+**Phase 2: Elasticsearch Plugin Update**
+*   Update the `elasticsearchVersion` in the plugin to target 8.x.
+*   Refactor the `HebrewAnalysisPlugin` class to adhere to the latest Elasticsearch `AnalysisPlugin` API.
+*   **Crucial:** Re-evaluate dictionary loading. Instead of requiring users to place files in `/var/lib/hspell-data-files` and fighting the Security Manager, bundle a pre-compiled, optimized binary representation of the dictionary directly into the plugin JAR (if licensing permits) or use the modern Elasticsearch `Environment` file-reading APIs securely.
+
+**Phase 3: Testing & CI**
+*   Migrate from Travis CI (which is heavily restricted for open source now) to GitHub Actions.
+*   Ensure the integration tests (`ESIntegTestCase`) run against a modern Elasticsearch cluster.
+
+## 5. Suggestions for Improvement
+*   **Pre-compiled Dictionary/FST:** Instead of parsing text-based `.wgz` and `.desc` files at runtime (which is slow and memory-intensive), build a tool that compiles the dictionary into a Lucene Finite State Transducer (FST) at build time. Load the FST at runtime. This will drastically reduce startup time, memory footprint, and eliminate the need for complex `DictRadix` structures.
+*   **Better Acronym Handling:** Develop a custom `QueryParser` or a character filter that intercepts Hebrew acronyms (e.g., צה"ל) and normalizes the quotes so standard query strings don't break them into multiple terms.
+*   **Plugin-less Architecture / Standalone Service:** If users find managing ES plugins cumbersome, consider exposing the "Gold" (the lemmatizer) as a high-performance standalone gRPC/REST microservice (written in Java, Go, or Rust). Documents could be pre-analyzed by this service before being indexed into standard Elasticsearch `keyword` or simple text fields.
+
+## 6. Recommendations: Rewrite, Port, or Split?
+**Recommendation: Rewrite the core logic and port it, then build a modern ES wrapper.**
+
+Given that the codebase has been unmaintained for years and relies on legacy data structures, a rewrite is the most viable path forward to achieve high performance and ease of maintenance.
+
+1.  **Extract and Rewrite the "Gold":**
+    *   Do not reuse the existing `DictRadix` or runtime `.wgz` parsing.
+    *   Write a script (in Python or Java) that parses the `hspell` dictionary *once* offline, and generates a standard Lucene Finite State Transducer (FST).
+    *   Rewrite the lemmatization logic to traverse this FST. This will be an order of magnitude faster and use a fraction of the memory.
+2.  **Language Porting (Optional but Recommended):**
+    *   If you want to move away from the JVM ecosystem entirely, porting the FST traversal and prefix-stripping logic to **Rust** or **Go** is highly recommended. You can then wrap the Rust/Go library in a lightweight standalone service, or use JNI/FFI if you must stay within Elasticsearch.
+    *   If staying with Elasticsearch, rewrite the core library in modern Java (Java 17/21).
+3.  **Split the Analyzers:**
+    *   Keep the analyzer definitions simple. Instead of complex TokenFilters that do everything, separate concerns:
+        *   `HebrewNormalizationCharFilter`: Removes Niqqud and normalizes quotes/acronyms before tokenization.
+        *   `HebrewTokenizer`: Splits words.
+        *   `HebrewLemmatizerTokenFilter`: Performs the actual dictionary lookup (via the new FST) and injects lemmas at the same position.
+    *   This modularity is standard in Lucene and makes testing much easier.
